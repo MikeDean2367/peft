@@ -377,3 +377,84 @@ def hub_online_once(model_id: str):
         if _HUB_MODEL_ACCESSES.get(model_id) == 0:
             del _HUB_MODEL_ACCESSES[model_id]
         raise
+
+
+def create_tiny_causal_lm(kind):
+    """Build a local random dense or MoE causal LM with eager native backends."""
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    config = AutoConfig.for_model(
+        kind,
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=24,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        num_experts=3,
+        num_local_experts=3,
+        num_experts_per_tok=2,
+        moe_intermediate_size=12,
+        enable_moe_block=True,
+        top_k_experts=2,
+        num_kv_shared_layers=0,
+        global_head_dim=8,
+        hidden_size_per_layer_input=0,
+        max_position_embeddings=131072 if kind == "gpt_oss" else 64,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=False,
+    )
+    config._attn_implementation = "eager"
+    config._experts_implementation = "eager"
+    return AutoModelForCausalLM.from_config(config)
+
+
+@contextmanager
+def deterministic_device(name):
+    """Restore RNG and precision settings around CPU/CUDA numerical checks."""
+    device = torch.device(name)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA runtime unavailable; this test has not run on a GPU.")
+    previous_threads = torch.get_num_threads()
+    precision = torch.get_float32_matmul_precision()
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    devices = [torch.cuda.current_device()] if device.type == "cuda" else []
+    try:
+        torch.set_num_threads(1)
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        with torch.random.fork_rng(devices=devices):
+            torch.random.default_generator.manual_seed(123)
+            if devices:
+                torch.cuda.manual_seed(123)
+            yield device
+            if devices:
+                torch.cuda.synchronize(device)
+    finally:
+        torch.set_float32_matmul_precision(precision)
+        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
+        torch.set_num_threads(previous_threads)
+
+
+class CudaTestFixtures:
+    @pytest.fixture(autouse=True)
+    def require_cuda(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA runtime unavailable; no GPU check ran.")
+
+    @pytest.fixture
+    def device(self):
+        with deterministic_device("cuda") as current:
+            yield current
+
+    @pytest.fixture(params=[torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+    def dtype(self, request, device):
+        if request.param == torch.bfloat16 and not torch.cuda.is_bf16_supported(including_emulation=False):
+            pytest.skip("This CUDA GPU does not support native BF16.")
+        return request.param

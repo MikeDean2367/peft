@@ -46,6 +46,7 @@ from peft import (
     BeftConfig,
     BOFTConfig,
     C3AConfig,
+    CortexConfig,
     DeloraConfig,
     EvaConfig,
     FrodConfig,
@@ -90,6 +91,9 @@ from peft import (
 )
 from peft.import_utils import is_torchao_available
 from peft.mapping import PEFT_TYPE_TO_PREFIX_MAPPING
+from peft.tuners.cortex.initialization import _indices
+from peft.tuners.cortex.layer import CortexLayer, CortexMLP
+from peft.tuners.cortex.structure import MlpStructure, describe_mlp
 from peft.tuners.lokr.layer import LoKrLayer
 from peft.tuners.lora.astra import preprocess_astra
 from peft.tuners.lora.config import AstraConfig, CordaConfig, LoraGAConfig
@@ -101,7 +105,10 @@ from peft.utils import infer_device
 from peft.utils.hotswap import hotswap_adapter, prepare_model_for_compiled_hotswap
 from peft.utils.other import ModulesToSaveWrapper
 
+from .test_cortex import CortexBiasChecks, configured_branch, cortex_config, hidden_output
+from .testing_utils import create_tiny_causal_lm as tiny_model
 from .testing_utils import hub_online_once, require_bitsandbytes, require_deterministic_for_xpu
+from .training.cortex_distributed import assert_initialization
 
 
 try:
@@ -7733,3 +7740,551 @@ class TestAdapterNameCollisionFiltering:
             module_name = key.rpartition(".")[0]
             weight = model.get_submodule(module_name)["lora_A"].weight
             assert torch.equal(lora_a_state_dict[key], weight)
+
+
+class TestCortexInitialization:
+    @pytest.mark.parametrize("width", [4, 24, 30])
+    @pytest.mark.parametrize("noise", [0.0, 0.01])
+    def test_sample_paired_neurons(self, width, noise):
+        from peft import CortexConfig
+
+        from .test_custom_models import CortexMLP
+
+        torch.manual_seed(123)
+        base = CortexMLP().eval()
+        with torch.no_grad():
+            base.lin0.gate_proj.weight.copy_(torch.arange(240).reshape(24, 10) / 1000)
+            base.lin0.up_proj.weight.copy_(base.lin0.gate_proj.weight + 1)
+        original = deepcopy(base)
+        model = get_peft_model(
+            base,
+            CortexConfig(
+                k=width,
+                target_modules=["lin0"],
+                init_weights="sample",
+                init_noise_std=noise,
+            ),
+        )
+        layer = model.get_base_model().lin0
+        gate = layer.cortex_gate["default"].weight
+        up = layer.cortex_up["default"].weight
+        if noise == 0:
+            torch.testing.assert_close(up - gate, torch.ones_like(gate))
+            for row in gate:
+                assert any(torch.equal(row, source) for source in original.lin0.gate_proj.weight)
+            if width < 24:
+                assert len(gate.unique(dim=0)) == width
+        else:
+            assert not torch.equal(up - gate, torch.ones_like(gate))
+        inputs = torch.randn(2, 10)
+        torch.testing.assert_close(model(inputs), original(inputs), rtol=0, atol=0)
+
+    def test_sample_checkpoint_low_memory_does_not_read_base_weights(self, tmp_path):
+        from peft import CortexConfig
+
+        from .test_custom_models import CortexMLP
+
+        base = CortexMLP().eval()
+        clean = deepcopy(base)
+        model = get_peft_model(
+            base,
+            CortexConfig(
+                k=4,
+                target_modules=["lin0"],
+                init_weights="sample",
+            ),
+        )
+        with torch.no_grad():
+            model.lin0.cortex_down["default"].weight.normal_(std=0.1)
+        model.save_pretrained(tmp_path)
+        with patch("peft.tuners.cortex.initialization._sample_branch", side_effect=AssertionError):
+            restored = PeftModel.from_pretrained(clean, tmp_path, low_cpu_mem_usage=True).eval()
+        inputs = torch.randn(2, 10)
+        torch.testing.assert_close(restored(inputs), model(inputs))
+
+
+class _CortexInitializationModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        from .test_custom_models import CortexFFN
+
+        self.mlp = CortexFFN(4, 4, width=12)
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class TestCortexPartitionedAndMoeInitialization:
+    @pytest.fixture(autouse=True)
+    def require_packed_layout_baseline(self):
+        pytest.importorskip("transformers", minversion="5.17.0")
+
+    def test_zero3_logical_shape_is_read_without_gathering(self):
+        from .testing_utils import create_tiny_causal_lm as tiny_model
+
+        experts = tiny_model("gpt_oss").model.layers[0].mlp.experts
+        expected = describe_mlp(experts)
+        for param in experts.parameters():
+            param.ds_shape = param.shape
+            param.data = param.data.new_empty(0)
+        actual = describe_mlp(experts)
+        assert (actual.input_dim, actual.intermediate_dim, actual.num_experts) == (
+            expected.input_dim,
+            expected.intermediate_dim,
+            expected.num_experts,
+        )
+
+    def test_only_method_roles_are_persisted(self):
+        from .testing_utils import create_tiny_causal_lm as tiny_model
+
+        model = get_peft_model(tiny_model("gpt_oss"), CortexConfig(k=3, moe_target=["shared", "routed"]))
+        config = model.peft_config["default"].to_dict()
+        assert set(config["target_roles"].values()) == {"routed_public"}
+        assert "expert_mode" not in config and "resolved_targets" not in config
+
+    @pytest.mark.parametrize("kind", ["gpt_oss", "qwen3_moe", "olmoe"])
+    @pytest.mark.parametrize("mode", ["shared", "routed", ["shared", "routed"]])
+    def test_moe_sampling_uses_matching_expert_or_public_pool(self, kind, mode):
+        from peft.tuners.cortex.structure import read_components
+
+        from .testing_utils import create_tiny_causal_lm as tiny_model
+
+        base = tiny_model(kind)
+        source = {key: value.detach() for key, value in read_components(base.model.layers[0].mlp.experts).items()}
+        with torch.no_grad():
+            for expert in range(source["up"].shape[0]):
+                rows = torch.arange(source["up"].shape[1], dtype=source["up"].dtype) + 100 * expert
+                source["up"][expert].copy_(rows[:, None])
+                source["gate"][expert].copy_(rows[:, None] + 1000)
+                if "gate_bias" in source:
+                    source["gate_bias"][expert].copy_(rows + 2000)
+                    source["up_bias"][expert].copy_(rows + 3000)
+        model = get_peft_model(
+            base,
+            CortexConfig(
+                k=5,
+                moe_target=mode,
+                init_weights="sample",
+                init_noise_std=0,
+                adapter_bias=kind == "gpt_oss",
+            ),
+        )
+        layer = model.get_base_model().model.layers[0].mlp.experts
+        branches = [("", mode != "shared")]
+        if mode == ["shared", "routed"]:
+            branches.append(("shared_", False))
+        for prefix, per_expert in branches:
+            for projection_kind in ("gate", "up"):
+                projection = getattr(layer, f"cortex_{prefix}{projection_kind}")["default"]
+                weights = projection.weight if per_expert else projection.weight.unsqueeze(0)
+                reference = (
+                    source[projection_kind] if per_expert else source[projection_kind].flatten(0, 1).unsqueeze(0)
+                )
+                for expert, weight in enumerate(weights):
+                    for row in weight:
+                        assert any(torch.equal(row, candidate) for candidate in reference[expert])
+                if projection.bias is not None:
+                    torch.testing.assert_close(
+                        projection.bias, projection.weight[..., 0] + (1000 if projection_kind == "gate" else 3000)
+                    )
+            gate = getattr(layer, f"cortex_{prefix}gate")["default"].weight
+            up = getattr(layer, f"cortex_{prefix}up")["default"].weight
+            torch.testing.assert_close(gate - up, torch.full_like(up, 1000))
+
+    @pytest.mark.parametrize("kind", ["nemotron_h", "qwen3_next", "deepseek_v3", "minimax_m3_vl"])
+    def test_sample_native_shared_latent_and_fused_blocks(self, kind):
+        from peft.tuners.cortex.layer import CortexLayer
+        from peft.tuners.cortex.structure import read_components
+
+        from .test_cortex import BlockModel
+
+        base = BlockModel(kind).eval()
+        original = deepcopy(base)
+        model = get_peft_model(
+            base, CortexConfig(k=5, moe_target=["shared", "routed"], init_weights="sample", init_noise_std=0)
+        )
+        for layer in model.modules():
+            if not isinstance(layer, CortexLayer):
+                continue
+            weights = layer.cortex_up["default"].weight
+            reference = read_components(layer.base_layer)["up"]
+            if not layer.per_expert:
+                weights, reference = weights.unsqueeze(0), reference.unsqueeze(0)
+            for expert, weight in enumerate(weights):
+                for row in weight:
+                    assert any(torch.equal(row, candidate) for candidate in reference[expert])
+        x = torch.randn(2, 3, 16)
+        torch.testing.assert_close(model(x), original(x), rtol=0, atol=0)
+        model(x).square().mean().backward()
+        assert all(p.grad is not None for p in model.parameters() if p.requires_grad)
+
+    def test_random_packed_weights_use_input_fan_in(self):
+        import math
+
+        from .testing_utils import create_tiny_causal_lm as tiny_model
+
+        model = get_peft_model(tiny_model("gpt_oss"), CortexConfig(k=64, moe_target="routed"))
+        layer = model.model.model.layers[0].mlp.experts
+        weight = layer.cortex_up["default"].weight
+        bound = 1 / math.sqrt(layer.in_features)
+        assert weight.abs().max() <= bound
+        assert weight.abs().max() > bound * 0.9
+        assert not torch.count_nonzero(layer.cortex_down["default"].weight)
+
+    def test_sample_reads_partitioned_parameters_inside_gather(self, monkeypatch):
+        from contextlib import contextmanager
+
+        from peft.tuners.cortex import initialization
+
+        base = _CortexInitializationModel()
+        saved = {}
+        for param in base.parameters():
+            saved[id(param)] = param.detach().clone()
+            param.ds_shape = param.shape
+            param.data = param.data.new_empty(0)
+        calls = []
+
+        @contextmanager
+        def gather(params, modifier_rank=0):
+            params = list(params)
+            calls.append((params, modifier_rank))
+            for param in params:
+                if id(param) in saved:
+                    param.data = saved[id(param)].clone()
+            yield
+            for param in params:
+                if id(param) in saved:
+                    param.data = param.data.new_empty(0)
+
+        monkeypatch.setattr(initialization, "gather_params_ctx", gather)
+        model = get_peft_model(
+            base,
+            CortexConfig(
+                k=3,
+                target_modules=["mlp"],
+                init_weights="sample",
+                init_noise_std=0,
+            ),
+        )
+        source_calls = [(params, rank) for params, rank in calls if any(id(p) in saved for p in params)]
+        assert len(source_calls) == 1 and source_calls[0][1] is None
+        assert len(source_calls[0][0]) == 2
+        layer = model.get_base_model().mlp
+        for row in layer.cortex_up["default"].weight:
+            assert any(torch.equal(row, original) for original in saved[id(layer.base_layer.up_proj.weight)])
+        with pytest.raises(ValueError, match="unpartitioned"):
+            model.merge_and_unload()
+
+    def test_sample_rejects_unmaterialized_parameters_without_silent_fallback(self):
+        base = _CortexInitializationModel()
+        for param in base.parameters():
+            param.ds_shape = param.shape
+            param.data = param.data.new_empty(0)
+        with pytest.raises(ValueError, match="materialized"):
+            get_peft_model(base, CortexConfig(k=3, target_modules=["mlp"], init_weights="sample"))
+
+
+INITIALIZATION_CASES = [
+    ("qwen3", "dense"),
+    ("qwen3_moe", "shared"),
+    ("qwen3_moe", "routed"),
+    ("gpt_oss", "shared"),
+    ("gpt_oss", "routed"),
+]
+
+
+class TestCortexBiasInitialization:
+    @pytest.fixture(autouse=True)
+    def deterministic_cpu(self):
+        previous_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(917)
+            yield
+        torch.set_num_threads(previous_threads)
+
+    @pytest.mark.parametrize("native_biases", [(False, False, False), (True, True, True), (True, False, True)])
+    @pytest.mark.parametrize("override", [None, False, True])
+    @pytest.mark.parametrize("bias_init", ["uniform", "zeros"])
+    def test_bias_layout_overrides_initial_output_and_gradients(self, native_biases, override, bias_init):
+        base = _CortexInitializationModel()
+        for kind, present in zip(("gate", "up", "down"), native_biases):
+            projection = getattr(base.mlp, kind + "_proj")
+            if present:
+                projection.bias = nn.Parameter(torch.full((projection.out_features,), 0.25))
+        reference = deepcopy(base)
+        config = CortexConfig(k=7, target_modules=["mlp"], adapter_bias=override, adapter_bias_init=bias_init)
+        model = get_peft_model(base, config)
+        layer = model.get_base_model().mlp
+        for kind, native_bias in zip(("gate", "up", "down"), native_biases):
+            projection = getattr(layer, "cortex_" + kind)["default"]
+            assert (projection.bias is not None) == (native_bias if override is None else override)
+            if projection.bias is not None:
+                if kind == "down" or bias_init == "zeros":
+                    assert torch.count_nonzero(projection.bias) == 0
+                else:
+                    assert 0 < projection.bias.abs().max() <= 1 / math.sqrt(4)
+        inputs = torch.randn(2, 4)
+        actual = model(inputs)
+        torch.testing.assert_close(actual, reference(inputs), rtol=0, atol=0)
+        actual.sum().backward()
+        down = layer.cortex_down["default"]
+        assert torch.isfinite(down.weight.grad).all() and down.weight.grad.abs().sum() > 0
+        for kind in ("gate", "up"):
+            projection = getattr(layer, "cortex_" + kind)["default"]
+            assert torch.count_nonzero(projection.weight.grad) == 0
+            if projection.bias is not None:
+                assert torch.count_nonzero(projection.bias.grad) == 0
+
+    @pytest.mark.parametrize("fused", [False, True])
+    @pytest.mark.parametrize("device", ["cpu", "meta"])
+    def test_auto_bias_handles_fused_and_nongated_projections_without_reading_values(self, fused, device):
+        base = nn.Module()
+        setattr(base, "gate_up_proj" if fused else "up_proj", nn.Linear(8, 24 if fused else 12, device=device))
+        base.down_proj = nn.Linear(12, 8, bias=False, device=device)
+        spec = MlpStructure(8, 8, 12, fused=fused, has_gate=fused, act_fn=nn.SiLU())
+        layer = CortexMLP(base, "default", CortexConfig(k=3), spec)
+        assert layer.cortex_up["default"].bias is not None
+        assert layer.cortex_down["default"].bias is None
+        if fused:
+            assert layer.cortex_gate["default"].bias is not None
+        else:
+            assert not layer.cortex_gate
+
+    def test_uniform_bias_initialization_repeats_with_the_same_seed(self):
+        base = tiny_model("gpt_oss")
+        states = []
+        for _ in range(2):
+            torch.manual_seed(1234)
+            model = get_peft_model(deepcopy(base), CortexConfig(k=7, init_weights=True))
+            states.append(get_peft_model_state_dict(model, save_embedding_layers=False))
+        for name, value in states[0].items():
+            torch.testing.assert_close(states[1][name], value, rtol=0, atol=0)
+
+
+class TestCortexBiases(CortexBiasChecks):
+    """Run the shared checks on CPU; GPU entries live in the GPU suite."""
+
+    @pytest.fixture(autouse=True)
+    def deterministic_cpu(self):
+        previous_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(917)
+            yield
+        torch.set_num_threads(previous_threads)
+
+    @pytest.fixture
+    def device(self):
+        return torch.device("cpu")
+
+
+class TestCortexInitializationSemantics:
+    @pytest.fixture(autouse=True)
+    def deterministic_cpu(self):
+        previous_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(917)
+            yield
+        torch.set_num_threads(previous_threads)
+
+    @pytest.mark.parametrize("kind,role", INITIALIZATION_CASES)
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+    @pytest.mark.parametrize("init", ["random", "sample"])
+    def test_zero_down_preserves_base_and_learns_with_nonzero_upstream_bias(self, kind, role, dtype, init):
+        current, layer = configured_branch(kind, role, dtype, init)
+        # Both zero-biased and random-biased gate/up can satisfy the starting-model
+        # contract. Use nonzero finite biases to exercise the stronger case.
+        with torch.no_grad():
+            layer.cortex_gate["default"].bias.fill_(0.35)
+            layer.cortex_up["default"].bias.fill_(0.7)
+        down = layer.cortex_down["default"]
+        assert torch.count_nonzero(down.weight) == torch.count_nonzero(down.bias) == 0
+        inputs = torch.randn(2, 5, 8, dtype=dtype)
+        with current.disable_adapter():
+            expected = hidden_output(current, inputs).detach()
+        actual = hidden_output(current, inputs)
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        actual.float().sum().backward()
+        # At W_down=0, data gradients reach down, but gate/up have zero data
+        # gradients. Optimizer weight decay is separate from this assertion.
+        for projection_kind in ("gate", "up"):
+            projection = getattr(layer, f"cortex_{projection_kind}")["default"]
+            assert torch.count_nonzero(projection.weight.grad) == 0
+            assert torch.count_nonzero(projection.bias.grad) == 0
+        assert torch.isfinite(down.weight.grad).all() and torch.isfinite(down.bias.grad).all()
+        assert down.weight.grad.abs().sum() > 0
+        assert down.bias.grad.abs().sum() > 0
+
+    @pytest.mark.parametrize("kind,role", INITIALIZATION_CASES)
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+    def test_upstream_bias_changes_first_down_gradient_without_changing_starting_output(self, kind, role, dtype):
+        current, layer = configured_branch(kind, role, dtype)
+        gate = layer.cortex_gate["default"]
+        up = layer.cortex_up["default"]
+        down = layer.cortex_down["default"]
+        assert torch.count_nonzero(gate.bias) == torch.count_nonzero(up.bias) == 0
+        inputs = torch.randn(2, 5, 8, dtype=dtype)
+        original = hidden_output(current, inputs)
+        gradient_zero_bias = torch.autograd.grad(original.float().sum(), down.weight)[0]
+        with torch.no_grad():
+            gate.bias.fill_(0.35)
+            up.bias.fill_(0.7)
+        shifted = hidden_output(current, inputs)
+        gradient_shifted_bias = torch.autograd.grad(shifted.float().sum(), down.weight)[0]
+        torch.testing.assert_close(original, shifted, rtol=0, atol=0)
+        assert torch.isfinite(gradient_zero_bias).all() and torch.isfinite(gradient_shifted_bias).all()
+        assert (gradient_shifted_bias != gradient_zero_bias).any()
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+    def test_zero_down_weight_alone_does_not_preserve_base_when_down_bias_is_nonzero(self, dtype):
+        current, layer = configured_branch("qwen3", "dense", dtype)
+        down = layer.cortex_down["default"]
+        assert torch.count_nonzero(down.weight) == 0
+        with torch.no_grad():
+            down.bias.fill_(0.5)
+        inputs = torch.randn(2, 5, 8, dtype=dtype)
+        with current.disable_adapter():
+            expected = hidden_output(current, inputs).detach()
+        actual = hidden_output(current, inputs)
+        torch.testing.assert_close(actual, expected + 0.5, rtol=0, atol=0)
+        assert (actual != expected).any()
+
+
+class TestCortexBranchInitialization:
+    @pytest.fixture(autouse=True)
+    def deterministic_cpu(self):
+        previous = torch.get_num_threads()
+        torch.set_num_threads(1)
+        torch.manual_seed(42)
+        yield
+        torch.set_num_threads(previous)
+
+    def test_equal_width_sampling_is_without_replacement(self):
+        for width in (1, 4, 24):
+            indices = _indices(width, width, torch.device("cpu"))
+            assert indices.sort().values.tolist() == list(range(width))
+        assert _indices(4, 7, torch.device("cpu")).shape == (7,)
+
+    def test_random_test_initialization_keeps_bias_zero(self):
+        model = get_peft_model(
+            tiny_model("gpt_oss"), CortexConfig(k=3, moe_target="routed", adapter_bias=True, init_weights=False)
+        )
+        biases = [p for name, p in model.named_parameters() if "cortex_" in name and name.endswith("bias")]
+        assert biases and all(torch.count_nonzero(p) == 0 for p in biases)
+        assert any(
+            p.count_nonzero() > 0 for name, p in model.named_parameters() if "cortex_down" in name and "weight" in name
+        )
+
+    @pytest.mark.parametrize("mode", ["shared", "routed", ["shared", "routed"]])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+    @pytest.mark.parametrize("bias_init", ["uniform", "zeros"])
+    def test_distributed_initialization_check_accepts_configured_biases(self, mode, dtype, bias_init):
+
+        torch.manual_seed(123)
+        config = CortexConfig(k=4, moe_target=mode, adapter_bias=True, adapter_bias_init=bias_init)
+        model = get_peft_model(tiny_model("gpt_oss").to(dtype), config, autocast_adapter_dtype=False)
+        assert_initialization(model, stage=None, config=config)
+        layer = next(module for module in model.modules() if isinstance(module, CortexLayer))
+        bias = layer.cortex_gate["default"].bias
+        if bias_init == "uniform":
+            # A fixed seed and several channels exercise the nonzero default.
+            assert torch.count_nonzero(bias) > 0
+        for invalid in (0.5, float("nan")):
+            with torch.no_grad():
+                bias.fill_(invalid)
+            with pytest.raises(AssertionError):
+                assert_initialization(model, stage=None, config=config)
+
+    @pytest.mark.parametrize("mode", ["shared", "routed", ["shared", "routed"]])
+    def test_moe_sample_copies_paired_real_channels_and_biases(self, mode):
+
+        base = tiny_model("gpt_oss")
+        with torch.no_grad():
+            for name, parameter in base.named_parameters():
+                if "experts" in name and "bias" in name:
+                    parameter.normal_()
+        model = get_peft_model(
+            base, CortexConfig(k=4, moe_target=mode, adapter_bias=True, init_weights="sample", init_noise_std=0)
+        )
+        assert_initialization(model, stage=0, config=model.peft_config["default"])
+
+    @pytest.mark.parametrize(
+        "kind,init",
+        [
+            pytest.param("gpt_oss", "sample", id="sample-with-source-bias"),
+            pytest.param("qwen3_moe", "sample", id="sample-without-source-bias"),
+            pytest.param("gpt_oss", "random", id="random"),
+            pytest.param("gpt_oss", False, id="random-down"),
+        ],
+    )
+    @pytest.mark.parametrize("bias_init", ["uniform", "zeros"])
+    def test_branch_initialization_overwrites_all_previous_parameter_values(self, kind, init, bias_init):
+        from peft.tuners.cortex.initialization import initialize_branch
+        from peft.tuners.cortex.structure import read_components
+
+        base = tiny_model(kind)
+        source = read_components(base.model.layers[0].mlp.experts, include_down=False)
+        with torch.no_grad():
+            for projection_kind, value in (("gate", 0.375), ("up", 0.75)):
+                if projection_kind + "_bias" in source:
+                    source[projection_kind + "_bias"].fill_(value)
+        config = CortexConfig(
+            k=3,
+            moe_target=["shared", "routed"],
+            adapter_bias=True,
+            adapter_bias_init=bias_init,
+            init_weights=init,
+            init_noise_std=0,
+        )
+        model = get_peft_model(base, config).eval()
+        layer = next(module for module in model.modules() if isinstance(module, CortexLayer))
+
+        # Both packed expert projections and the shared nn.Linear branch must be
+        # completely initialized independently of their constructor's old contents.
+        for prefix, per_expert in (("", True), ("shared_", False)):
+            projections = {
+                projection_kind: getattr(layer, f"cortex_{prefix}{projection_kind}")["default"]
+                for projection_kind in ("gate", "up", "down")
+            }
+            with torch.no_grad():
+                for projection in projections.values():
+                    for parameter in projection.parameters():
+                        parameter.fill_(float("nan"))
+            initialize_branch(layer, "default", config, prefix=prefix, per_expert=per_expert)
+            for projection_kind, projection in projections.items():
+                assert all(torch.isfinite(parameter).all() for parameter in projection.parameters())
+                if projection_kind == "down" and init is not False:
+                    assert torch.count_nonzero(projection.weight) == 0
+                elif init != "sample":
+                    bound = projection.weight.shape[-1] ** -0.5
+                    assert projection.weight.abs().max() <= bound
+                    assert torch.count_nonzero(projection.weight) > 0
+                if init == "random" and bias_init == "uniform" and projection_kind != "down":
+                    assert 0 < projection.bias.abs().max() <= projection.weight.shape[-1] ** -0.5
+                    continue
+                expected_bias = 0.0
+                if init == "sample" and projection_kind + "_bias" in source:
+                    expected_bias = 0.375 if projection_kind == "gate" else 0.75
+                torch.testing.assert_close(
+                    projection.bias,
+                    torch.full_like(projection.bias, expected_bias),
+                    rtol=0,
+                    atol=0,
+                )
+
+        tokens = torch.randint(3, 32, (1, 5))
+        actual = model(tokens).logits
+        assert torch.isfinite(actual).all()
+        if init is not False:
+            with model.disable_adapter():
+                expected = model(tokens).logits
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_invalid_targets_fail_before_replacement(self):
+        model = tiny_model("qwen3")
+        with pytest.raises(ValueError, match="Unsupported Cortex target"):
+            get_peft_model(model, cortex_config(target_modules=["mlp", "q_proj"]))
+        assert not any(isinstance(m, CortexLayer) for m in model.modules())

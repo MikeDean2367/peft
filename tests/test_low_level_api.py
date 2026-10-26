@@ -14,6 +14,7 @@
 import copy
 import platform
 import re
+from copy import deepcopy
 
 import pytest
 import torch
@@ -53,6 +54,8 @@ from peft import (
 from peft.tuners import lora
 from peft.utils import ModulesToSaveWrapper
 
+from .test_cortex import activate_branches, cortex_config
+from .testing_utils import create_tiny_causal_lm as tiny_model
 from .testing_utils import hub_online_once
 
 
@@ -978,3 +981,30 @@ class TestStateDictFsdpShapeValidation:
         peft_model = get_peft_model(DummyModel(), LoraConfig(target_modules=["linear"], r=4))
         peft_model.save_pretrained(tmp_path / "ok-adapter")
         assert (tmp_path / "ok-adapter" / "adapter_config.json").exists()
+
+
+class TestCortexPackedInjection:
+    @pytest.fixture(autouse=True)
+    def deterministic_cpu(self):
+        pytest.importorskip("transformers", minversion="5.17.0")
+        previous_threads = torch.get_num_threads()
+        torch.manual_seed(123)
+        torch.set_num_threads(1)
+        yield
+        torch.set_num_threads(previous_threads)
+
+    @pytest.mark.parametrize("kind", ["qwen3_moe", "gpt_oss"])
+    def test_state_dict_driven_direct_injection(self, kind):
+        from peft import inject_adapter_in_model, set_peft_model_state_dict
+
+        base = tiny_model(kind).eval()
+        clean = deepcopy(base)
+        model = get_peft_model(base, cortex_config("routed")).eval()
+        activate_branches(model)
+        state = get_peft_model_state_dict(model.get_base_model(), save_embedding_layers=False)
+        config = deepcopy(model.peft_config["default"])
+        restored = inject_adapter_in_model(config, clean, adapter_name="restored", state_dict=state)
+        result = set_peft_model_state_dict(restored, state, adapter_name="restored")
+        assert not result.unexpected_keys
+        tokens = torch.randint(3, 32, (1, 5))
+        torch.testing.assert_close(restored(tokens, use_cache=False).logits, model(tokens, use_cache=False).logits)
