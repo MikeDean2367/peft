@@ -41,6 +41,7 @@ from peft import (
     BeftConfig,
     BOFTConfig,
     C3AConfig,
+    CortexConfig,
     DeftConfig,
     DeloraConfig,
     FourierFTConfig,
@@ -112,6 +113,13 @@ def _reset_unilora_theta_d(model, config, adapter_name="default"):
 # EmbConv1D has an embedding and a Conv1D layer
 # Conv2D has a Conv2D layer
 TEST_CASES = [
+    ("Cortex random", "CortexMLP", CortexConfig, {"target_modules": ["lin0"], "k": 4}),
+    (
+        "Cortex sample",
+        "CortexMLP",
+        CortexConfig,
+        {"target_modules": ["lin0", "lin1"], "k": 4, "init_weights": "sample", "init_noise_std": 0},
+    ),
     # ShadowPEFT is not tested here: it needs a real decoder stack (not MLP/Conv custom
     # models), and wiring a dedicated TinyDecoder into this suite clashes with the shared
     # custom-model assumptions. Coverage lives in test_shadow.py, test_decoder_models.py,
@@ -1408,6 +1416,20 @@ ALL_PEFT_CONFIG_CASES = [
 # The model used for this test is `MLP`, which uses linear layers `lin0` and `lin1`
 MULTIPLE_ACTIVE_ADAPTERS_TEST_CASES = [
     (
+        "Cortex same target",
+        "cortex",
+        CortexConfig,
+        {"target_modules": ["lin0"], "k": 4, "init_weights": False},
+        {"target_modules": ["lin0"], "k": 3, "init_weights": False},
+    ),
+    (
+        "Cortex different targets",
+        "cortex",
+        CortexConfig,
+        {"target_modules": ["lin0"], "k": 4, "init_weights": False},
+        {"target_modules": ["lin1"], "k": 3, "init_weights": False},
+    ),
+    (
         "LoRA Same",
         "lora",
         LoraConfig,
@@ -1948,6 +1970,32 @@ def _skip_tests_with_multiple_adapters_with_target_parameters(config_cls, config
         pytest.skip("AdaLoRA only supports a single trainable adapter")
 
 
+class CortexFFN(nn.Module):
+    """Custom FFN opting into Cortex's standard gated contract."""
+
+    def __init__(self, input_dim, output_dim, width=24):
+        super().__init__()
+        self.gate_proj = nn.Linear(input_dim, width, bias=False)
+        self.up_proj = nn.Linear(input_dim, width, bias=False)
+        self.down_proj = nn.Linear(width, output_dim, bias=False)
+        self.act_fn = nn.SiLU()
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class CortexMLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lin0 = CortexFFN(10, 20)
+        self.lin1 = CortexFFN(20, 2)
+        self.sm = nn.LogSoftmax(dim=-1)
+        self.dtype = torch.float32
+
+    def forward(self, X):
+        return self.sm(self.lin1(self.lin0(X.to(self.dtype) / 10)))
+
+
 class MLP(nn.Module):
     def __init__(self, bias=True):
         super().__init__()
@@ -2067,6 +2115,14 @@ class DeepMLP(nn.Module):
         X = self.out(X)
         X = self.sm(X)
         return X
+
+
+def _deep_mlp_for_config(config_cls):
+    model = DeepMLP(size=256)
+    if config_cls is CortexConfig:
+        for layer in model.layers:
+            layer.lin0 = CortexFFN(256, 256)
+    return model
 
 
 class ModelEmbConv1D(nn.Module):
@@ -2447,6 +2503,9 @@ class MockTransformerWrapper:
 
         if dtype is None:
             dtype = torch.float32
+
+        if model_id == "CortexMLP":
+            return CortexMLP().to(dtype)
 
         if model_id == "MLP":
             return MLP().to(dtype)
@@ -3769,7 +3828,7 @@ class TestPeftCustomModel(PeftCommonTester):
             pytest.skip(reason="Model has no embedding layer, skipping TrainableTokensConfig.")
         if config_cls is AdaLoraConfig:
             pytest.skip(reason="AdaLoRA supports only a single trainable adapter")
-        model = DeepMLP(size=256)  # a size that works with all adapters
+        model = _deep_mlp_for_config(config_cls)  # a size that works with all adapters
         extra_kwargs = {}
         if config_cls == IA3Config:
             extra_kwargs["feedforward_modules"] = []
@@ -3824,7 +3883,7 @@ class TestPeftCustomModel(PeftCommonTester):
             pytest.skip(reason="Trainable tokens does not support modules_to_save")
         if config_cls is AdaLoraConfig:
             pytest.skip(reason="AdaLoRA supports only a single trainable adapter")
-        model = DeepMLP(size=256)  # a size that works with all adapters
+        model = _deep_mlp_for_config(config_cls)  # a size that works with all adapters
         extra_kwargs = {}
         if config_cls == IA3Config:
             extra_kwargs["feedforward_modules"] = []
@@ -3922,7 +3981,7 @@ class TestPeftCustomModel(PeftCommonTester):
             pytest.skip(reason="Trainable tokens does not support modules_to_save")
         if config_cls is AdaLoraConfig:
             pytest.skip(reason="AdaLoRA supports only a single trainable adapter")
-        model = DeepMLP(size=256)  # a size that works with all adapters
+        model = _deep_mlp_for_config(config_cls)  # a size that works with all adapters
         extra_kwargs = {}
         if config_cls == IA3Config:
             extra_kwargs["feedforward_modules"] = []
@@ -3944,7 +4003,7 @@ class TestPeftCustomModel(PeftCommonTester):
             pytest.skip(reason="Trainable tokens does not support modules_to_save")
         if config_cls is AdaLoraConfig:
             pytest.skip(reason="AdaLoRA supports only a single trainable adapter")
-        model = DeepMLP(size=256)  # a size that works with all adapters
+        model = _deep_mlp_for_config(config_cls)  # a size that works with all adapters
         extra_kwargs = {}
         if config_cls == IA3Config:
             extra_kwargs["feedforward_modules"] = []
@@ -3970,7 +4029,7 @@ class TestPeftCustomModel(PeftCommonTester):
             pytest.skip(reason="Trainable tokens does not support modules_to_save")
         if config_cls is AdaLoraConfig:
             pytest.skip(reason="AdaLoRA supports only a single trainable adapter")
-        model = DeepMLP(size=256)  # a size that works with all adapters
+        model = _deep_mlp_for_config(config_cls)  # a size that works with all adapters
         extra_kwargs = {}
         if config_cls == IA3Config:
             extra_kwargs["feedforward_modules"] = []
@@ -4383,7 +4442,7 @@ class TestPeftCustomModel(PeftCommonTester):
         if config_cls == IA3Config:
             config_kwargs["feedforward_modules"] = []
         config0 = config_cls(**config_kwargs)
-        model = DeepMLP(size=256)  # a size that works with all adapters
+        model = _deep_mlp_for_config(config_cls)  # a size that works with all adapters
         model = get_peft_model(model, config0, adapter_name="adapter0").eval()
 
         # check that it works with a single adapter
@@ -5583,6 +5642,8 @@ class TestMultipleActiveAdapters:
                 module.set_adapter(adapter_names)
 
     def resolve_model_cls(self, tuner_method):
+        if tuner_method == "cortex":
+            return CortexMLP()
         if tuner_method == "lora+trainable_tokens":
             # for this method we need an Embedding layer to target
             return ModelEmbConv1D()
@@ -7773,7 +7834,7 @@ class TestRequiresGrad:
         # AdaLoRA's `ranknum` parameter is keyed by adapter name (so name contains ".default") but is intentionally
         # requires_grad=False, so we exclude it from the trainable-param check below.
         skip_ranknum = config_cls is AdaLoraConfig
-        model = DeepMLP(size=256)  # a size that works with all adapters
+        model = _deep_mlp_for_config(config_cls)  # a size that works with all adapters
         extra_kwargs = {}
         if config_cls == IA3Config:
             extra_kwargs["feedforward_modules"] = []
@@ -7789,7 +7850,7 @@ class TestRequiresGrad:
         model.save_pretrained(tmp_path)
         del model
 
-        model = DeepMLP(size=256)
+        model = _deep_mlp_for_config(config_cls)
         if config_cls == TrainableTokensConfig:  # TrainbleTokens requires a different base
             model = ModelEmbConv1D()
         model = PeftModel.from_pretrained(model, tmp_path, is_trainable=is_trainable)
@@ -7875,7 +7936,7 @@ class TestRequiresGrad:
         # See note in test_loading_model_requires_grad_set_correctly: AdaLoRA's `ranknum.default` is intentionally
         # non-trainable, so we exclude it from the trainable-param check below.
         skip_ranknum = config_cls is AdaLoraConfig
-        model = DeepMLP(size=256)  # a size that works with all adapters
+        model = _deep_mlp_for_config(config_cls)  # a size that works with all adapters
         extra_kwargs = {}
         if config_cls == IA3Config:
             extra_kwargs["feedforward_modules"] = []
@@ -7887,7 +7948,7 @@ class TestRequiresGrad:
         model.save_pretrained(tmp_path)
         del model
 
-        model = DeepMLP(size=256)
+        model = _deep_mlp_for_config(config_cls)
         model = PeftModel.from_pretrained(model, tmp_path, is_trainable=is_trainable)
 
         if is_trainable:

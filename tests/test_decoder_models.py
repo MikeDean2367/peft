@@ -1686,3 +1686,52 @@ class TestDecoderModels(PeftCommonTester):
             inputs = torch.arange(10).view(1, -1).to(self.torch_device)
             with pytest.raises(ValueError, match="skipped every layer"):
                 model(inputs)
+
+
+class TestCortexDecoderModels(PeftCommonTester):
+    """Run the common battery on local tiny models with complete gated FFNs."""
+
+    transformers_class = AutoModelForCausalLM
+
+    def prepare_inputs_for_testing(self):
+        ids = torch.tensor([[1, 3, 4], [1, 5, 6]], device=self.torch_device)
+        return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+    @pytest.mark.parametrize("architecture", ["llama", "qwen2"])
+    @pytest.mark.parametrize(
+        "check",
+        [
+            "_test_model_attr",
+            "_test_prepare_for_training",
+            "_test_save_pretrained",
+            "_test_merge_layers",
+            "_test_disable_adapter",
+            "_test_load_model_low_cpu_mem_usage",
+            "_test_training",
+            "_test_generate",
+            "_test_training_gradient_checkpointing",
+        ],
+    )
+    def test_common(self, architecture, check, tmp_path):
+        from transformers import AutoConfig
+
+        from peft import CortexConfig
+
+        config = AutoConfig.for_model(
+            architecture,
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=24,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            max_position_embeddings=64,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=2,
+            tie_word_embeddings=False,
+        )
+        model_id = str(tmp_path / architecture)
+        AutoModelForCausalLM.from_config(config).save_pretrained(model_id)
+        kwargs = {"k": 4, "task_type": "CAUSAL_LM", "init_weights": False}
+        getattr(self, check)(model_id, CortexConfig, kwargs)
