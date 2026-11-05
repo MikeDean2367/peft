@@ -25,7 +25,7 @@ from .structure import MlpStructure
 
 
 class ExpertLinear(nn.Module):
-    """One projection per expert, stored as [E, out, in].
+    """One linear projection per expert, with weights stored as [E, out, in].
 
     Expert slices belong to one Parameter. Unselected slices receive zero gradients when another slice participates in
     the graph; standard AdamW still applies decay and existing momentum and shares its step counter across slices.
@@ -53,7 +53,12 @@ class ExpertLinear(nn.Module):
 
 
 class CortexLayer(nn.Module, BaseTunerLayer):
-    """Flat adapter storage compatible with PEFT checkpoint name handling."""
+    """Shared base for Cortex adapters on dense FFNs and packed experts.
+
+    Manages adapter projections, initialization, and merge state. Flat ModuleDicts keyed by adapter name keep parameter
+    names compatible with PEFT checkpoints. The main branch uses cortex_*; routed_public stores its additional public
+    branch in cortex_shared_*.
+    """
 
     adapter_layer_names = (
         "cortex_gate",
@@ -77,6 +82,30 @@ class CortexLayer(nn.Module, BaseTunerLayer):
         routing_args: tuple[str, str] | None = None,
         moe_spec: CortexMoeSpec | None = None,
     ) -> None:
+        """Initialize the wrapper and its first adapter.
+
+        Args:
+            base_layer (`nn.Module`):
+                Native FFN or packed experts module to wrap.
+            adapter_name (`str`):
+                Name of the first adapter added to this wrapper.
+            config (`CortexConfig`):
+                Configuration used to create and initialize the adapter.
+            structure (`MlpStructure`):
+                Resolved FFN dimensions, projection layout, activation, and field mappings.
+            role (`str`, *optional*, defaults to `"dense"`):
+                `dense` for an ordinary FFN, `shared` for a native shared FFN, `routed` for per-expert branches,
+                `public` for a branch evaluated for every token, or `routed_public` for both routed and public
+                branches.
+            public_scale (`float`, *optional*):
+                Proven constant sum of selected routing weights, used to rescale the down projection when merging an
+                unweighted public branch. `None` means this sum has not been established.
+            routing_args (`tuple[str, str]`, *optional*):
+                Expert forward argument names in `(indices_name, weights_name)` order. For packed experts, `None`
+                resolves these names from a supported native signature.
+            moe_spec (`CortexMoeSpec`, *optional*):
+                Resolved field mapping for the enclosing MoE block, when applicable.
+        """
         super().__init__()
         self.base_layer = base_layer
         self.structure = structure
@@ -243,7 +272,11 @@ class CortexLayer(nn.Module, BaseTunerLayer):
 
 
 class CortexMLP(CortexLayer):
-    """Branch inside a dense or native shared FFN, preserving outer operations."""
+    """Add Cortex branches to a dense or native shared FFN.
+
+    The native forward supplies the base output; active, unmerged adapter branches are added to it. Any auxiliary tuple
+    outputs are preserved.
+    """
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor | tuple[object, ...]:
         if self.disable_adapters and self.merged:
@@ -261,11 +294,14 @@ class CortexMLP(CortexLayer):
 
 
 class CortexExperts(CortexLayer):
-    """Reference backend using original routing without per-token weight copies.
+    """Add routed and public Cortex branches using the native expert selections and weights.
 
-    Each selected expert processes its token group with ordinary linear calls. This Python loop is a correctness
-    backend, not a fused production kernel. The native base output and routed increments are accumulated separately;
-    their mathematical sum need not reproduce the floating-point rounding of a legacy combined expert forward.
+    Routed branches process each selected expert's token group and accumulate weighted increments. Public branches are
+    evaluated once for all tokens, with optional weighting by the sum of routing weights.
+
+    This reference backend uses a Python loop with ordinary linear calls, avoiding per-token weight copies. It has no
+    fused kernel. The native base output and routed increments are accumulated separately, so floating-point rounding
+    may differ from a combined expert forward.
     """
 
     def _public_branch(

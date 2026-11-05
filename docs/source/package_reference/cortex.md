@@ -93,9 +93,13 @@ The [custom FFN classification example](https://github.com/huggingface/peft/tree
 
 ## Custom structure specifications
 
-Use [`CortexFfnSpec`] and [`CortexMoeSpec`] when a model uses supported FFN computations but different field names. The built-in registry and user configuration use these same description classes. Specifications select existing structure; they do not implement a new FFN formula or router.
+Use [`CortexFfnSpec`] and [`CortexMoeSpec`] when a model uses supported FFN computations but different field names. The built-in registry and user configuration use these same classes to describe existing FFN and router structures.
 
-`ffn_specs` and `moe_specs` map a class name to its specification. A fully qualified name, such as `my_package.modeling.MyFfn`, takes precedence over the short class name. Supplying a specification opts that class into automatic discovery. Use `target_modules` to restrict which instances are adapted. Each specification is a complete description with its own defaults; it replaces the class's built-in entry rather than partially overriding it.
+### Configure field mappings
+
+`ffn_specs` and `moe_specs` map a class name to its specification. A fully qualified name, such as `my_package.modeling.MyFfn`, takes precedence over the short class name. Each specification includes its own defaults and replaces the class's complete built-in entry.
+
+Providing a specification enables automatic discovery for that class. Use `target_modules` to restrict which instances are adapted.
 
 For an FFN computing `w2(activation(w1(x)) * w3(x))`, with its constructor width stored in `config.ffn_channels`:
 
@@ -116,7 +120,9 @@ config = CortexConfig(
 )
 ```
 
-Names refer to direct attributes of the FFN, not dotted paths. Set `has_gate=False` for `down(act(up(x)))`. Use `gate_up_proj` to name a fused gate/up projection, and `packed=True` for packed expert parameters. Packed experts still need the supported layout metadata. If the FFN stores its current width under a nonstandard attribute, set `width_attributes`, for example `width_attributes=("channels",)`, so merge and unmerge update it.
+Names refer to direct attributes of the FFN, not dotted paths. Set `has_gate=False` for `down(act(up(x)))`. Use `gate_up_proj` to name a fused gate/up projection, and `packed=True` for packed expert parameters. Packed experts still need the supported layout metadata.
+
+If the FFN stores its current width under a nonstandard attribute, set `width_attributes`, for example `width_attributes=("channels",)`, so merge and unmerge update it.
 
 For an MoE whose routed experts are stored in `bank` and shared FFN in `common`, add:
 
@@ -131,21 +137,29 @@ config.moe_specs = {
 }
 ```
 
-The routing names describe the packed experts' `forward` arguments. The example requires `forward(hidden_states, selected_ids, selected_weights)`: the first argument must literally be named `hidden_states`, and the first three arguments must accept positional calls. A signature starting with `x`, or using keyword-only routing arguments, is rejected. Omit both routing names to use the supported native signatures. Also provide an `ffn_specs` entry for the experts class if its projection names differ. Set `shared_modules=()` only when the MoE has no native shared FFN. `None` discovers conventional shared-FFN names; if none are found, it leaves their absence unresolved.
+The routing names describe the packed experts' `forward` arguments. The example requires `forward(hidden_states, selected_ids, selected_weights)`: the first argument must be named `hidden_states`, and the first three arguments must accept positional calls. Omit both routing names to use the supported native signatures. Also provide an `ffn_specs` entry for the experts class if its projection names differ.
 
-Cortex validates the referenced projections, shapes, activation and expert signature before injection. By providing a specification, you declare that the module follows the corresponding supported computation; checking names and shapes does not prove equivalence for an arbitrary custom `forward`. These specifications also do not establish that routing weights have a constant sum: an unweighted public branch still needs a known routing rule to merge. A routing-weighted public branch can merge without that assumption.
+Set `shared_modules=()` only when the MoE has no native shared FFN. `None` discovers conventional shared-FFN names; if none are found, it leaves their absence unresolved.
 
-Specifications are saved in the adapter configuration and restored on load. Export uses the same width binding for untargeted FFNs of that class, padding them when needed to keep native reload consistent. The width field must describe the constructor's actual FFN width. Extra normalization, residual operations or other unsupported arithmetic still require dedicated implementation support. Check nonzero adapter outputs before merge, after merge and after native reload when adding a model.
+### Validate and reuse specifications
 
-Structure specifications describe the base model, independently of an adapter's selected targets. Include the descriptions of untargeted custom FFNs that share its export width fields. Reuse the complete `ffn_specs` and `moe_specs` mappings for every adapter on that model. Cortex rejects different or missing descriptions across adapters; short and fully qualified keys are equivalent when they resolve to the same class and specification. This keeps each saved adapter self-contained when loaded independently or when another adapter is deleted. Do not change these mappings after injection.
+Cortex validates the referenced projections, shapes, activation and expert signature before injection. Providing a specification declares that the module follows the corresponding supported computation; checking names and shapes does not prove equivalence for an arbitrary custom `forward`. Extra normalization, residual operations or other unsupported arithmetic still require dedicated implementation support. Public-branch merging follows the routing requirements in [MoE branches](#moe-branches).
 
-To probe a new configuration, put its fields in a JSON file without resolved `target_roles`, then run:
+Specifications are saved in the adapter configuration and restored on load. The width field must describe the constructor's actual FFN width. Export uses the same width binding for untargeted FFNs of that class, padding them when needed to keep native reload consistent.
+
+Structure specifications describe the base model, independently of an adapter's selected targets. Include descriptions of untargeted custom FFNs that share its export width fields, and reuse the complete `ffn_specs` and `moe_specs` mappings for every adapter on that model. Keep these mappings unchanged after injection so each saved adapter remains self-contained.
+
+Cortex rejects different or missing descriptions across adapters. Short and fully qualified keys are equivalent when they resolve to the same class and specification.
+
+To run the [numerical layout check](#supported-architectures) on a new configuration, put its fields in a JSON file without resolved `target_roles`, then run:
 
 ```sh
 python examples/cortex/validate_layout.py --model-name path/to/config-directory --cortex-config cortex.json --k 2 4
 ```
 
-Command-line probe options override the JSON fields. An explicit `k` or `moe_target` in the JSON selects those widths or MoE branches; when omitted, the probe uses widths 2 and 4 and explores the applicable dense or MoE modes, including parent blocks described by `moe_specs`. As in training, JSON `moe_target` has no effect on a dense-only selection. A complete JSON saved by `CortexConfig.save_pretrained` includes its defaults, so those values also constrain the probe. The [example README](https://github.com/huggingface/peft/tree/main/examples/cortex#check-a-transformers-layout) shows a minimal configuration for exploration. The script constructs a native Transformers model; specifications do not import custom model code or enable `trust_remote_code`.
+Command-line probe options override the JSON fields. An explicit `k` or `moe_target` in the JSON selects those widths or MoE branches; when omitted, the probe uses widths 2 and 4 and explores the applicable dense or MoE modes, including parent blocks described by `moe_specs`. As in training, JSON `moe_target` has no effect on a dense-only selection.
+
+A complete JSON saved by `CortexConfig.save_pretrained` includes its defaults, so those values also constrain the probe. The [example README](https://github.com/huggingface/peft/tree/main/examples/cortex#check-a-transformers-layout) shows a minimal configuration for exploration. The script constructs a native Transformers model; specifications do not import custom model code or enable `trust_remote_code`.
 
 Mode sweeps apply to selected MoE parent blocks. Explicit shared-FFN targets always exercise shared branches, and explicit expert-module targets always exercise routed branches, regardless of a JSON or CLI `moe_target` value. Selecting both leaves checks their combination once per width and preserves any selected dense FFNs. When parents and fixed leaves from different blocks are selected together, `moe_target` changes only the parent selections.
 
