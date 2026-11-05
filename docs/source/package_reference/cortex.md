@@ -70,7 +70,9 @@ An inferred MoE can have shared experts outside the router's immediate parent. I
 
 `get_peft_model()` automatically performs structure and interface checks, but does not run numerical equivalence checks. When integrating a new model, run `validate_layout.py` separately to compare outputs with nonzero adapter parameters before merge, after merge, and after native reload.
 
-When Cortex infers a layout, the warning lists representative module paths. The [layout check](https://github.com/huggingface/peft/blob/main/examples/cortex/validate_layout.py) explores dense FFNs or the shared, routed, and combined MoE selections at different widths. Use `--cortex-config` to validate a new configuration with custom specifications before injecting or training an adapter. To check **one saved adapter configuration**, use `--adapter-config`; this preserves its paths, roles, and widths and rejects probe overrides. The check uses a small random model and validates the selected layout on the reduced configuration, not the training quality of a saved checkpoint.
+When Cortex infers a layout, the warning lists representative module paths and links to this section. The [layout check](https://github.com/huggingface/peft/tree/main/examples/cortex#check-a-transformers-layout) explores dense FFNs or the shared, routed, and combined MoE selections at different widths. The script is not installed by pip; obtain it from a PEFT source checkout matching your installed release or commit, and run it from the repository root.
+
+Use `--cortex-config` to validate a new configuration with custom specifications before injecting or training an adapter. To check **one saved adapter configuration**, use `--adapter-config`; this preserves its paths, roles, and widths and rejects probe overrides. The check uses a small random model and validates the selected layout on the reduced configuration, not the training quality of a saved checkpoint.
 
 ## Target selection
 

@@ -27,6 +27,11 @@ also demonstrates the API outside a causal language model.
 
 ## Check a Transformers layout
 
+The probe is an example script and is not installed by `pip install peft`.
+Clone the [PEFT repository](https://github.com/huggingface/peft) and check out
+the release tag or commit matching your PEFT installation. For development
+versions, use the same source checkout as the installed package.
+
 Run the probe from the repository root with a local model config directory or
 a Hub model ID. To explore a model's layouts at two different channel widths:
 

@@ -30,10 +30,9 @@ from peft import CortexConfig, get_peft_model
 from peft.tuners.cortex.layer import CortexLayer, ExpertLinear
 from peft.tuners.cortex.structure import (
     UnresolvedSharedExpertsError,
-    is_expert_candidate,
     is_ffn_candidate,
     is_moe,
-    resolve_moe_spec,
+    resolve_target_branches,
     text_backbone_prefixes,
 )
 from peft.tuners.tuners_utils import check_target_module_exists
@@ -236,27 +235,22 @@ def selected_moe_branches(base, targets, excluded, config):
         if path in excluded:
             continue
 
-        spec = resolve_moe_spec(module, config.moe_specs)
-        if spec is not None:
-            routed = path + "." + spec.experts not in excluded
+        kind, routed_path, shared_paths = resolve_target_branches(base, path, config.ffn_specs, config.moe_specs)
+        if kind == "moe":
+            routed = routed_path not in excluded
             if routed:
                 parent_branches.add("routed")
-            if spec.shared_modules is None:
+            if shared_paths is None:
                 # Unknown ownership must still reach the tuner's unsupported-layout check.
                 parent_branches.add("shared")
-            elif spec.shared_modules:
-                if any(path + "." + name not in excluded for name in spec.shared_modules):
+            elif shared_paths:
+                if any(shared_path not in excluded for shared_path in shared_paths):
                     parent_branches.add("shared")
             elif routed:
                 # A public branch is installed on the routed experts module.
                 parent_branches.add("shared")
-        elif is_expert_candidate(module, config.ffn_specs):
-            leaf_branches.add("routed")
-        else:
-            parent_path, _, child = path.rpartition(".")
-            spec = resolve_moe_spec(base.get_submodule(parent_path), config.moe_specs)
-            if spec is not None and child in (spec.shared_modules or ()):
-                leaf_branches.add("shared")
+        elif kind in {"routed", "shared"}:
+            leaf_branches.add(kind)
     return parent_branches, leaf_branches
 
 

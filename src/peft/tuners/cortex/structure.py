@@ -358,6 +358,34 @@ def shared_names(module: nn.Module, moe_specs: dict[str, CortexMoeSpec] | None =
     return list(spec.shared_modules or ()) if spec is not None else []
 
 
+def resolve_target_branches(
+    model: nn.Module,
+    path: str,
+    ffn_specs: dict[str, CortexFfnSpec] | None = None,
+    moe_specs: dict[str, CortexMoeSpec] | None = None,
+) -> tuple[str, str | None, tuple[str, ...] | None]:
+    """Classify a target and locate its native branches, without applying exclusions or runtime checks.
+
+    Return the kind (moe, routed, shared, or dense), the routed path, and the shared paths. For a MoE parent, shared
+    paths of None mean unknown ownership; an empty tuple means no native shared FFN. Only parent targets depend on
+    moe_target. Explicit leaves retain their own role, independently of any saved adapter roles.
+    """
+    module = model.get_submodule(path)
+    spec = resolve_moe_spec(module, moe_specs)
+    if spec is not None:
+        prefix = path + "." if path else ""
+        shared = None if spec.shared_modules is None else tuple(prefix + name for name in spec.shared_modules)
+        return "moe", prefix + spec.experts, shared
+    if is_expert_candidate(module, ffn_specs):
+        return "routed", path, ()
+
+    parent_path, _, child = path.rpartition(".")
+    parent_spec = resolve_moe_spec(model.get_submodule(parent_path), moe_specs)
+    if parent_spec is not None and child in (parent_spec.shared_modules or ()):
+        return "shared", None, (path,)
+    return "dense", None, ()
+
+
 def public_merge_scale(block: nn.Module, moe_specs: dict[str, CortexMoeSpec] | None = None) -> float | None:
     """Prove constant routing mass from audited native rules, never from user field names."""
     block = unwrap(block)

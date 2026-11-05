@@ -22,6 +22,7 @@ import os
 import runpy
 import subprocess
 import sys
+import warnings
 import weakref
 from contextlib import contextmanager
 from copy import deepcopy
@@ -52,7 +53,7 @@ from peft.tuners.cortex import model as model_utils
 from peft.tuners.cortex import runtime as runtime_utils
 from peft.tuners.cortex.layer import CortexExperts, CortexLayer, CortexMLP, ExpertLinear
 from peft.tuners.cortex.runtime import check_moe_forward_hook
-from peft.tuners.cortex.structure import describe_mlp, is_moe, shared_names
+from peft.tuners.cortex.structure import describe_mlp, is_moe, resolve_target_branches, shared_names
 from peft.utils.other import ModulesToSaveWrapper
 
 from .testing_utils import ARCHITECTURES, BlockModel, NativeFFNModel, activate_branches, configured_branch
@@ -663,6 +664,47 @@ def renamed_ffn_specs():
 
 @pytest.mark.usefixtures("deterministic_cortex_cpu")
 class TestCortexStructureSpecs:
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            ("mlp.0", ("dense", None, ())),
+            ("mlp.1", ("moe", "mlp.1.bank", ("mlp.1.common",))),
+            ("mlp.1.bank", ("routed", "mlp.1.bank", ())),
+            ("mlp.1.common", ("shared", None, ("mlp.1.common",))),
+        ],
+    )
+    def test_target_branch_paths_follow_custom_specs(self, path, expected):
+        config = PretrainedConfig(ffn_channels=8, expert_channels=6)
+        base = NativeFFNModel(nn.Sequential(RenamedFfn(config), RenamedMoe(config, True)), config)
+        adapter = CortexConfig(
+            k=2,
+            moe_target=["shared", "routed"],
+            ffn_specs=renamed_ffn_specs(),
+            moe_specs={
+                "RenamedMoe": CortexMoeSpec(
+                    experts="bank",
+                    shared_modules=("common",),
+                    routing_indices="selected_ids",
+                    routing_weights="selected_weights",
+                )
+            },
+        )
+        assert resolve_target_branches(base, path, adapter.ffn_specs, adapter.moe_specs) == expected
+        get_peft_model(base, adapter)
+        # Wrapping a physical leaf does not change its native branch classification.
+        assert resolve_target_branches(base, path, adapter.ffn_specs, adapter.moe_specs) == expected
+
+    @pytest.mark.parametrize("shared_modules", [None, ()])
+    def test_target_branch_paths_preserve_unknown_shared_ownership(self, shared_modules):
+        config = PretrainedConfig(expert_channels=6)
+        base = NativeFFNModel(RenamedMoe(config, False), config)
+        specs = {"RenamedMoe": CortexMoeSpec(experts="bank", shared_modules=shared_modules)}
+        assert resolve_target_branches(base, "mlp", renamed_ffn_specs(), specs) == (
+            "moe",
+            "mlp.bank",
+            shared_modules,
+        )
+
     @pytest.mark.parametrize("init", ["random", "sample"])
     @pytest.mark.parametrize("qualified", [False, True])
     @pytest.mark.parametrize("ffn_class", [RenamedFfn, RenamedFusedFfn])
@@ -1021,6 +1063,19 @@ class TestCortexNativeModels:
         yield
         torch.set_num_threads(previous_threads)
 
+    @pytest.mark.parametrize(
+        "kind,path,expected",
+        [
+            ("qwen3_next", "mlp", ("moe", "mlp.experts", ("mlp.shared_expert",))),
+            ("qwen3_next", "mlp.experts", ("routed", "mlp.experts", ())),
+            ("qwen3_next", "mlp.shared_expert", ("shared", None, ("mlp.shared_expert",))),
+            ("mistral", "model.layers.0.mlp", ("dense", None, ())),
+        ],
+    )
+    def test_target_branch_paths_use_registered_and_inferred_layouts(self, kind, path, expected):
+        base = BlockModel(kind) if kind == "qwen3_next" else tiny_model(kind)
+        assert resolve_target_branches(base, path) == expected
+
     def test_olmoe_public_merge_rejected_without_modifying_model(self):
         base = tiny_model("olmoe").eval()
         assert base.config.norm_topk_prob is False
@@ -1252,7 +1307,7 @@ class TestCortexNativeModels:
         tokens = torch.tensor([[1, 3, 5, 7]])
         baseline = clean(tokens).logits.detach()
 
-        with pytest.warns(UserWarning, match=r"validate_layout\.py") as warnings:
+        with pytest.warns(UserWarning, match="Cortex inferred unregistered Transformers layouts") as warnings:
             model = get_peft_model(base, CortexConfig(k=3)).eval()
         assert len(warnings) == 1
         roles = {f"model.layers.{i}.mlp": "dense" for i in range(2)}
@@ -1263,10 +1318,30 @@ class TestCortexNativeModels:
 
         model.save_pretrained(tmp_path, save_embedding_layers=False)
         # Saved target paths name physical leaves. Replaying them as CLI selections could change a MoE role.
-        with pytest.warns(UserWarning, match="--adapter-config"):
+        with pytest.warns(UserWarning, match="Cortex inferred unregistered Transformers layouts"):
             loaded = PeftModel.from_pretrained(clean, tmp_path, adapter_name="restored").eval()
         assert loaded.peft_config["restored"].target_roles == roles
         torch.testing.assert_close(loaded(tokens).logits, adapted)
+
+    @pytest.mark.parametrize("explicit_spec", [False, True])
+    def test_explicit_inferred_target_warning_links_docs_and_respects_spec(self, explicit_spec):
+        config = CortexConfig(
+            k=2,
+            target_modules=["model.layers.0.mlp"],
+            ffn_specs={"MistralMLP": CortexFfnSpec()} if explicit_spec else {},
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            get_peft_model(tiny_model("mistral"), config)
+        inferred = [
+            item for item in caught if "Cortex inferred unregistered Transformers layouts" in str(item.message)
+        ]
+        assert len(inferred) == (0 if explicit_spec else 1)
+        if inferred:
+            message = str(inferred[0].message)
+            assert "https://huggingface.co/docs/peft/main/package_reference/cortex#supported-architectures" in message
+            assert "examples/cortex/validate_layout.py" not in message
+        assert config.target_roles == {"model.layers.0.mlp": "dense"}
 
     @pytest.mark.parametrize("target_talker", [False, True])
     def test_registered_ffn_in_omni_talker_requires_explicit_selection(self, target_talker, tmp_path):
@@ -1346,7 +1421,7 @@ class TestCortexNativeModels:
 
         prefix = "model.language_model.layers"
         config = CortexConfig(k=3, exclude_modules=[f"{prefix}.1.mlp"])
-        with pytest.warns(UserWarning, match=r"validate_layout\.py"):
+        with pytest.warns(UserWarning, match="Cortex inferred unregistered Transformers layouts"):
             model = get_peft_model(base, config)
         assert config.target_roles == {f"{prefix}.0.mlp": "dense"}
         tokens = torch.tensor([[1, 3, 5, 7]])
@@ -1579,12 +1654,66 @@ class TestCortexNativeModels:
         for mode in modes:
             assert f"{leaves[mode]} ({mode}, cortex_down" in output
 
-    @pytest.mark.parametrize("selection", ["parent_and_leaf", "excluded_shared_leaf"])
-    def test_layout_probe_keeps_parent_controls_separate_from_fixed_roles(self, selection):
+    @pytest.mark.parametrize(
+        "selection,expected_modes,expected_roles",
+        [
+            pytest.param(
+                {"target_modules": ["mlp.0"], "moe_target": ["shared", "routed"]},
+                ["shared", "routed"],
+                {"mlp.0.common": "shared", "mlp.0.bank": "routed"},
+                id="parent",
+            ),
+            pytest.param(
+                {"target_modules": ["mlp.0.common"], "moe_target": "routed"},
+                ["shared"],
+                {"mlp.0.common": "shared"},
+                id="shared-leaf",
+            ),
+            pytest.param(
+                {"target_modules": ["mlp.0.bank"], "moe_target": "shared"},
+                ["routed"],
+                {"mlp.0.bank": "routed"},
+                id="routed-leaf",
+            ),
+            pytest.param(
+                {"target_modules": ["mlp.0.common", "mlp.0.bank"]},
+                ["shared", "routed"],
+                {"mlp.0.common": "shared", "mlp.0.bank": "routed"},
+                id="both-leaves",
+            ),
+            pytest.param(
+                {"target_modules": ["mlp.0"], "exclude_modules": ["mlp.0.common"]},
+                ["routed"],
+                {"mlp.0.bank": "routed"},
+                id="excluded-shared",
+            ),
+            pytest.param(
+                {"target_modules": ["mlp.0"], "exclude_modules": ["mlp.0.bank"]},
+                ["shared"],
+                {"mlp.0.common": "shared"},
+                id="excluded-routed",
+            ),
+            pytest.param(
+                {"target_modules": ["mlp.0", "mlp.1.bank"], "moe_target": "shared"},
+                ["shared", "routed"],
+                {"mlp.0.common": "shared", "mlp.1.bank": "routed"},
+                id="parent-and-fixed-leaf",
+            ),
+            pytest.param(
+                {"target_modules": ["mlp.0", "mlp.1.bank", "mlp.2"], "moe_target": "shared"},
+                ["shared", "routed"],
+                {"mlp.0.common": "shared", "mlp.1.bank": "routed", "mlp.2": "dense"},
+                id="mixed-dense-parent-and-leaf",
+            ),
+        ],
+    )
+    def test_layout_probe_and_tuner_follow_expected_target_roles(self, selection, expected_modes, expected_roles):
         from examples.cortex.validate_layout import probe_cases
 
         config = PretrainedConfig(ffn_channels=8, expert_channels=6)
-        base = NativeFFNModel(nn.Sequential(RenamedMoe(config, True), RenamedMoe(config, True)), config)
+        base = NativeFFNModel(
+            nn.Sequential(RenamedMoe(config, True), RenamedMoe(config, True), RenamedFfn(config)), config
+        )
         values = {
             "ffn_specs": renamed_ffn_specs(),
             "moe_specs": {
@@ -1595,17 +1724,8 @@ class TestCortexNativeModels:
                     routing_weights="selected_weights",
                 )
             },
-            "target_modules": ["mlp.0"],
+            **selection,
         }
-        if selection == "parent_and_leaf":
-            values["target_modules"].append("mlp.1.bank")
-            values["moe_target"] = "shared"
-            expected_roles = {"mlp.0.common": "shared", "mlp.1.bank": "routed"}
-            expected_modes = ["shared", "routed"]
-        else:
-            values["exclude_modules"] = ["mlp.0.common"]
-            expected_roles = {"mlp.0.bank": "routed"}
-            expected_modes = ["routed"]
         args = argparse.Namespace(
             target_modules=None,
             target_regex=None,
@@ -1621,11 +1741,13 @@ class TestCortexNativeModels:
         assert len(cases) == 1
         adapter, modes = cases[0]
         assert modes == expected_modes
-        if selection == "parent_and_leaf":
-            # Expectations include the fixed leaf without enabling routed channels on the selected parent.
-            assert adapter.moe_target == "shared"
+        if "moe_target" in selection:
+            assert adapter.moe_target == selection["moe_target"]
         model = get_peft_model(base, adapter)
         assert model.peft_config["default"].target_roles == expected_roles
+        assert {path: module.role for path, module in base.named_modules() if isinstance(module, CortexLayer)} == (
+            expected_roles
+        )
 
     @pytest.mark.parametrize("saved_target", ["mlp.1", "mlp.1.common"])
     def test_layout_probe_excludes_modules_reserved_for_full_training(self, saved_target):
@@ -1770,7 +1892,7 @@ class TestCortexNativeModels:
         else:
             base.config.dense_intermediate_size = base.config.intermediate_size
         clean = deepcopy(base)
-        with pytest.warns(UserWarning, match=r"validate_layout\.py"):
+        with pytest.warns(UserWarning, match="Cortex inferred unregistered Transformers layouts"):
             model = get_peft_model(base, CortexConfig(k=3))
         activate_branches(model)
         tokens = torch.tensor([[1, 3, 5, 7]])
@@ -1810,7 +1932,7 @@ class TestCortexNativeModels:
         base = AutoModelForCausalLM.from_config(config, experts_implementation="eager").eval()
         tokens = torch.tensor([[1, 3, 5, 7]])
         baseline = base(tokens).logits.detach()
-        with pytest.warns(UserWarning, match=r"validate_layout\.py") as warnings:
+        with pytest.warns(UserWarning, match="Cortex inferred unregistered Transformers layouts") as warnings:
             model = get_peft_model(base, CortexConfig(k=3, k_routed=2, k_shared=5, moe_target=mode)).eval()
         assert len(warnings) == 1
         roles = {"model.layers.0.mlp": "dense", "model.layers.1.mlp.experts": "routed"}

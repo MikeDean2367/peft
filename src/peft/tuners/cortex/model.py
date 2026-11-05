@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import shlex
 import warnings
 from copy import copy
 
@@ -44,6 +43,7 @@ from .structure import (
     public_merge_scale,
     resolve_ffn_spec,
     resolve_moe_spec,
+    resolve_target_branches,
     shared_names,
     text_backbone_prefixes,
     unwrap,
@@ -215,17 +215,10 @@ class CortexModel(BaseTuner):
         if not inferred:
             return
 
-        model_name = getattr(getattr(self.model, "config", None), "name_or_path", "") or "MODEL_ID_OR_CONFIG_DIR"
-        command = f"python examples/cortex/validate_layout.py --model-name {shlex.quote(str(model_name))}"
-        if config.target_roles:
-            # A saved expert path can mean routed, public, or both. Pass the config rather than guessing from the path.
-            command += " --adapter-config PATH_TO_SAVED_ADAPTER"
-            check = "Check the roles and widths in your saved adapter configuration"
-        else:
-            check = "Explore the supported branch modes and widths on a small model"
         layouts = ", ".join(f"{name} ({path})" for name, path in sorted(inferred.items()))
         warnings.warn(
-            f"Cortex inferred unregistered Transformers layouts: {layouts}. {check}:\n{command}",
+            f"Cortex inferred unregistered Transformers layouts: {layouts}. For numerical validation, see "
+            "https://huggingface.co/docs/peft/main/package_reference/cortex#supported-architectures.",
             UserWarning,
             stacklevel=2,
         )
@@ -454,13 +447,14 @@ class CortexModel(BaseTuner):
         targets = [targets] if isinstance(targets, str) else targets
         for path in selected:
             module = model.get_submodule(path)
-            moe_spec = resolve_moe_spec(module, peft_config.moe_specs)
-            if moe_spec is not None:
+            kind, experts_path, shared_paths = resolve_target_branches(
+                model, path, peft_config.ffn_specs, peft_config.moe_specs
+            )
+            if kind == "moe":
                 if module not in checked_parents:
                     check_moe_forward(module)
                     checked_parents.add(module)
-                experts_path = path + "." + moe_spec.experts
-                experts = getattr(module, moe_spec.experts, None)
+                experts = getattr(module, experts_path.rpartition(".")[2], None)
                 if not _is_key_under_prefixes(experts_path, auxiliary_roots) and (
                     experts is None or not is_expert_candidate(experts, peft_config.ffn_specs)
                 ):
@@ -468,18 +462,17 @@ class CortexModel(BaseTuner):
                         f"{path} ({native_name(module)}) requires a supported packed expert layout at {experts_path}; "
                         "older ModuleList experts and other incompatible layouts are unsupported."
                     )
-                shared = moe_spec.shared_modules
-                if shared is None and "shared" in targets:
+                if shared_paths is None and "shared" in targets:
                     raise UnresolvedSharedExpertsError(
                         f"Cannot infer the shared FFN for {path} ({native_name(module)}). It may live outside "
                         "this MoE block. Use moe_target='routed' or explicitly target a supported shared FFN."
                     )
-                if shared:
+                if shared_paths:
                     if "routed" in targets:
                         target_roles[experts_path] = "routed"
                     if "shared" in targets:
-                        for child in shared:
-                            target_roles[path + "." + child] = "shared"
+                        for shared_path in shared_paths:
+                            target_roles[shared_path] = "shared"
                 else:
                     if len(targets) == 2:
                         role = "routed_public"
@@ -488,17 +481,8 @@ class CortexModel(BaseTuner):
                     else:
                         role = "routed"
                     target_roles[experts_path] = role
-            elif is_expert_candidate(module, peft_config.ffn_specs):
-                # Selecting an expert leaf explicitly always selects routed experts.
-                target_roles[path] = "routed"
             else:
-                parent_path, _, child = path.rpartition(".")
-                parent = model.get_submodule(parent_path)
-                target_roles[path] = (
-                    "shared"
-                    if is_moe(parent, peft_config.moe_specs) and child in shared_names(parent, peft_config.moe_specs)
-                    else "dense"
-                )
+                target_roles[path] = kind
         return target_roles
 
     @staticmethod
