@@ -288,7 +288,7 @@ def validate_case(template, factory, backend, config, tokens, modes):
     expected_roles = dict(config.target_roles)
     baseline = base(tokens, use_cache=False).logits
 
-    # An inferred layout normally warns the user to invoke this very script.
+    # Suppress the inferred-layout reminder while performing its numerical validation.
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore", message="Cortex inferred unregistered Transformers layouts:", category=UserWarning

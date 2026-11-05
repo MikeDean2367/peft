@@ -677,7 +677,9 @@ class CortexModel(BaseTuner):
                 Names of the adapters to merge. Defaults to the active adapters. Previously merged adapter channels
                 remain in the base weights, even if their adapters are not selected here. To export only the selected
                 adapters relative to the current wrapper's original base, call `unmerge_adapter()` first. All adapter
-                wrappers are removed on export; save their checkpoints first if they are needed later.
+                wrappers are removed on export; save their checkpoints first if they are needed later. Each
+                `modules_to_save` wrapper retains the selected adapter's copy, or the original module if no selected
+                adapter has a copy. Selecting multiple copies of the same module raises an error.
 
         Returns:
             `torch.nn.Module`: The native model with wider FFNs. For registered Transformers layouts or inferred

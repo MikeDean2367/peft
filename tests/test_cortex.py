@@ -2058,7 +2058,7 @@ class TestCortexNativeModels:
             f"model.layers.{i}.block_sparse_moe.experts": "routed" for i in range(2)
         }
 
-    def test_safe_merge_failure_is_atomic_and_bias_free_export_rejected(self):
+    def test_merge_preflight_rejects_nonfinite_weights_and_unsupported_bias(self):
         model = get_peft_model(tiny_model("qwen3"), CortexConfig(k=3))
         layers = [m for m in model.modules() if isinstance(m, CortexLayer)]
         with torch.no_grad():
@@ -2342,7 +2342,7 @@ def _unchanged_adapter_model(model, pending_config):
 
 @contextmanager
 def _reject_parameter_assignment(projection, failure, monkeypatch):
-    """Reject the first weight assignment or every assignment, including recovery attempts."""
+    """Reject the first or every weight assignment through a setter or registration hook."""
     original_setattr = nn.Linear.__setattr__
     failed = False
 

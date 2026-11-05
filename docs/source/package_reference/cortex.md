@@ -82,6 +82,8 @@ For MoE, select the parent block, such as `model.layers.0.mlp`, to control branc
 
 Use `modules_to_save` to train and save a full module, such as a classification head. Cortex adapts the FFNs outside those modules and existing auxiliary wrappers. Choose saved modules that do not contain Cortex layers.
 
+Avoid parent-child `modules_to_save` targets across adapters, such as `model.layers.1` and `model.layers.1.mlp`. Nested wrappers can remain after export and prevent native reload.
+
 For a custom FFN using the conventional names below, set `target_modules` explicitly:
 
 - **Computation:** **`down(act(gate(x)) * up(x))`**, or `down(act(up(x)))` without a gate. Use ordinary `nn.Linear` projections named `up_proj`, `down_proj`, and optionally `gate_proj`, with a supported deterministic elementwise activation exposed as `act_fn`, such as SiLU or GELU.
@@ -241,6 +243,8 @@ Saved configurations retain resolved target paths and roles. Create a fresh `Cor
 model.unmerge_adapter()
 exported = model.merge_and_unload(adapter_names=["task2"], safe_merge=True)
 ```
+
+For each `modules_to_save` module, export retains the copy belonging to the selected adapter, even if another adapter is currently active. If none of the selected adapters has a copy, export retains the original module. Selecting multiple copies of the same module raises an error before merging; different saved modules can belong to different selected adapters.
 
 Keep adapter checkpoints if you need task switching. Unmerge before adding another adapter to an existing merged wrapper. For sequential training on an exported model, inject a fresh adapter into the returned native model. Small floating-point differences between merged and unmerged outputs are expected.
 
