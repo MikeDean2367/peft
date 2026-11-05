@@ -28,10 +28,9 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from peft import CortexConfig, get_peft_model
 from peft.tuners.cortex.layer import CortexLayer, ExpertLinear
+from peft.tuners.cortex.model import _iter_target_candidates
 from peft.tuners.cortex.structure import (
     UnresolvedSharedExpertsError,
-    is_ffn_candidate,
-    is_moe,
     resolve_target_branches,
     text_backbone_prefixes,
 )
@@ -214,24 +213,12 @@ def matched_paths(paths, selection, option):
 
 def selected_moe_branches(base, targets, excluded, config):
     """Separate mode-dependent parents from leaves whose branch role is fixed."""
-    automatic = config.target_modules is None
-    roots = text_backbone_prefixes(base)
-    boundaries = set()
+    if config.target_modules is None:
+        candidates = _iter_target_candidates(base.named_modules(), config, text_roots=text_backbone_prefixes(base))
+    else:
+        candidates = ((path, module) for path, module in base.named_modules() if path and path in targets)
     parent_branches, leaf_branches = set(), set()
-    for path, module in base.named_modules():
-        if not path:
-            continue
-        if automatic:
-            if roots is not None and not any(path == root or path.startswith(root + ".") for root in roots):
-                continue
-            if any(path.startswith(parent + ".") for parent in boundaries):
-                continue
-            if not (is_moe(module, config.moe_specs) or is_ffn_candidate(module, config.ffn_specs)):
-                continue
-            # Discovery selects the parent boundary once, even if it is subsequently excluded.
-            boundaries.add(path)
-        elif path not in targets:
-            continue
+    for path, _ in candidates:
         if path in excluded:
             continue
 

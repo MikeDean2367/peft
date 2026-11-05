@@ -1658,6 +1658,30 @@ class TestCortexNativeModels:
         "selection,expected_modes,expected_roles",
         [
             pytest.param(
+                {"moe_target": ["shared", "routed"]},
+                ["shared", "routed"],
+                {
+                    "mlp.0.common": "shared",
+                    "mlp.0.bank": "routed",
+                    "mlp.1.common": "shared",
+                    "mlp.1.bank": "routed",
+                    "mlp.2": "dense",
+                },
+                id="automatic",
+            ),
+            pytest.param(
+                {"exclude_modules": ["mlp.0"], "moe_target": ["shared", "routed"]},
+                ["shared", "routed"],
+                {"mlp.1.common": "shared", "mlp.1.bank": "routed", "mlp.2": "dense"},
+                id="automatic-excluded-parent",
+            ),
+            pytest.param(
+                {"exclude_modules": ["mlp.0", "mlp.1"], "moe_target": ["shared", "routed"]},
+                [],
+                {"mlp.2": "dense"},
+                id="automatic-excluded-moe-parents",
+            ),
+            pytest.param(
                 {"target_modules": ["mlp.0"], "moe_target": ["shared", "routed"]},
                 ["shared", "routed"],
                 {"mlp.0.common": "shared", "mlp.0.bank": "routed"},

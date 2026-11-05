@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -46,6 +47,36 @@ from .structure import (
 if TYPE_CHECKING:
     from .config import CortexFfnSpec, CortexMoeSpec
     from .layer import CortexLayer
+
+
+@dataclass
+class _ExportCandidate:
+    """An FFN and its possible constructor-width bindings, before export validation."""
+
+    path: str
+    module: nn.Module
+    config: PretrainedConfig | None
+    fields: tuple[str, ...]
+    multiplier: int
+
+
+@dataclass
+class _ExportMember:
+    """A native FFN whose width must track its export group's config field."""
+
+    module: nn.Module
+    multiplier: int
+    ffn_spec: CortexFfnSpec
+
+
+@dataclass
+class _ExportGroup:
+    """The shared constructor width and all FFNs that must be padded to match it."""
+
+    config: PretrainedConfig
+    field: str
+    width: int = 0
+    members: list[_ExportMember] = field(default_factory=list)
 
 
 def unmerge_state(module: nn.Module, spec: MlpStructure) -> dict[str, Any]:
@@ -261,7 +292,7 @@ def export_plan(
     *,
     ffn_specs: dict[str, CortexFfnSpec] | None = None,
     moe_specs: dict[str, CortexMoeSpec] | None = None,
-) -> list[dict[str, Any]]:
+) -> list[_ExportGroup]:
     """Preflight all config-coupled FFNs, including unadapted layers.
 
     Shared and routed FFNs sometimes use the same config field. Round up that field and zero-pad other members so
@@ -307,7 +338,7 @@ def export_plan(
         for name, child in module.named_children():
             yield from walk(child, f"{path}.{name}" if path else name, owner, name in shared_modules)
 
-    members = []
+    candidates = []
     changed_fields = set()
     changed_configs = set()
     text_roots = text_backbone_prefixes(model)
@@ -323,13 +354,15 @@ def export_plan(
         ):
             continue
         config, fields, multiplier = width_binding(base, path, owner, ffn_specs, shared=shared)
-        members.append((path, module, config, fields, multiplier))
+        candidates.append(_ExportCandidate(path, module, config, fields, multiplier))
         if isinstance(module, CortexLayer) and (module.merged or module.merge_names(adapter_names)):
             changed_configs.add(id(config))
             changed_fields.update((id(config), field) for field in fields)
 
-    groups = {}
-    for path, module, config, fields, multiplier in members:
+    groups: dict[tuple[int, str], _ExportGroup] = {}
+    for candidate in candidates:
+        path, module, config = candidate.path, candidate.module, candidate.config
+        fields, multiplier = candidate.fields, candidate.multiplier
         if id(config) not in changed_configs:
             continue
         if not fields:
@@ -369,17 +402,18 @@ def export_plan(
                     desired += module.cortex_shared_up[name].weight.shape[-2]
 
         # All FFNs built from this config field must fit when the native model is reloaded.
-        group = groups.setdefault((id(config), field), {"config": config, "field": field, "width": 0, "members": []})
-        group["width"] = max(group["width"], math.ceil(desired / multiplier))
-        group["members"].append((base, multiplier, spec.ffn_spec))
+        group = groups.setdefault((id(config), field), _ExportGroup(config=config, field=field))
+        group.width = max(group.width, math.ceil(desired / multiplier))
+        group.members.append(_ExportMember(module=base, multiplier=multiplier, ffn_spec=spec.ffn_spec))
     return list(groups.values())
 
 
-def apply_export_plan(plan: list[dict[str, Any]]) -> None:
+def apply_export_plan(plan: list[_ExportGroup]) -> None:
     for group in plan:
-        for module, multiplier, ffn_spec in group["members"]:
-            pad_width(module, multiplier * group["width"], ffn_spec=ffn_spec)
+        for member in group.members:
+            module = member.module
+            pad_width(module, member.multiplier * group.width, ffn_spec=member.ffn_spec)
             local = getattr(module, "config", None)
-            if type(local) is type(group["config"]):
-                setattr(local, group["field"], group["width"])
-        setattr(group["config"], group["field"], group["width"])
+            if type(local) is type(group.config):
+                setattr(local, group.field, group.width)
+        setattr(group.config, group.field, group.width)

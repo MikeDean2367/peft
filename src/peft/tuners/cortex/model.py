@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import warnings
+from collections.abc import Callable, Collection, Iterable, Iterator
 from copy import copy
 
 from torch import Tensor, nn
@@ -48,6 +49,37 @@ from .structure import (
     text_backbone_prefixes,
     unwrap,
 )
+
+
+def _iter_target_candidates(
+    named_modules: Iterable[tuple[str, nn.Module]],
+    config: CortexConfig,
+    *,
+    text_roots: set[str] | None,
+    auxiliary_roots: Collection[str] = (),
+) -> Iterator[tuple[str, nn.Module]]:
+    """Discover outermost FFN/MoE boundaries without applying target exclusions.
+
+    Excluding a discovered parent must not make its descendants independent targets. Existing auxiliary wrappers
+    instead own their whole subtree and are skipped before discovery.
+    """
+    boundaries = set()
+    for path, module in named_modules:
+        if (
+            not path
+            or _is_key_under_prefixes(path, auxiliary_roots)
+            or any(path.startswith(parent + ".") for parent in boundaries)
+        ):
+            continue
+        if text_roots is not None and not _is_key_under_prefixes(path, text_roots):
+            continue
+        if (
+            isinstance(module, CortexLayer)
+            or is_moe(module, config.moe_specs)
+            or is_ffn_candidate(module, config.ffn_specs)
+        ):
+            boundaries.add(path)
+            yield path, module
 
 
 class CortexModel(BaseTuner):
@@ -284,30 +316,63 @@ class CortexModel(BaseTuner):
                     raise ValueError(f"Cannot infer a Cortex layout for {path} outside the model's text backbone.")
             return True
 
-        # Select the MoE parent once. Its shared and routed FFNs are resolved separately below.
+        selected = self._select_target_paths(
+            peft_config,
+            named_modules,
+            checkpoint_targets=checkpoint_targets,
+            text_roots=text_roots,
+            auxiliary_roots=auxiliary_roots,
+            available=available,
+        )
+        if automatic and peft_config.moe_target in ("routed", ["routed"]):
+            selected = self._routed_only_targets(model, selected, peft_config)
+
+        checked_parents = set()
+        if checkpoint_targets is not None:
+            target_roles = self._checkpoint_target_roles(
+                peft_config, model, selected, auxiliary_roots, checked_parents
+            )
+        elif peft_config.target_roles:
+            if set(selected) != set(peft_config.target_roles):
+                raise ValueError("Resolved adapter targets do not match the current model.")
+            target_roles = peft_config.target_roles
+        else:
+            target_roles = self._expand_target_roles(peft_config, model, selected, auxiliary_roots, checked_parents)
+
+        # Parent selections may expand to excluded or separately owned FFNs.
+        target_roles = {path: role for path, role in target_roles.items() if available(path)}
+        resolved = self._validate_target_roles(model, target_roles, checked_parents, peft_config)
+        if automatic and auxiliary_roots and not resolved:
+            raise ValueError("No eligible native FFNs remain outside auxiliary training wrappers and exclusions.")
+        return resolved
+
+    def _select_target_paths(
+        self,
+        peft_config: CortexConfig,
+        named_modules: list[tuple[str, nn.Module]],
+        *,
+        checkpoint_targets: set[str] | None,
+        text_roots: set[str] | None,
+        auxiliary_roots: set[str],
+        available: Callable[[str], bool],
+    ) -> list[str]:
+        """Select logical targets, or physical checkpoint paths, on the resolver's config copy.
+
+        Use the resolver's availability check during matching and again after role expansion, preserving exclusion and
+        ownership error ordering in both stages.
+        """
         if checkpoint_targets is None and peft_config.target_modules is None:
-            targets = []
-            for name, module in named_modules:
-                if (
-                    not name
-                    or _is_key_under_prefixes(name, auxiliary_roots)
-                    or any(name.startswith(parent + ".") for parent in targets)
-                ):
-                    continue
-                # A speech decoder can reuse the exact FFN class of the text decoder.
-                if not within_text_backbone(name):
-                    continue
-                if (
-                    isinstance(module, CortexLayer)
-                    or is_moe(module, peft_config.moe_specs)
-                    or is_ffn_candidate(module, peft_config.ffn_specs)
-                ):
-                    targets.append(name)
+            targets = {
+                path
+                for path, _ in _iter_target_candidates(
+                    named_modules, peft_config, text_roots=text_roots, auxiliary_roots=auxiliary_roots
+                )
+            }
             if not targets:
                 if auxiliary_roots:
                     raise ValueError("No eligible native FFNs remain outside auxiliary training wrappers.")
                 raise ValueError("No supported native FFNs found; specify target_modules for an audited structure.")
-            peft_config.target_modules = set(targets)
+            peft_config.target_modules = targets
 
         if checkpoint_targets is None:
             selected = [
@@ -331,27 +396,7 @@ class CortexModel(BaseTuner):
 
         if any(name.startswith(parent + ".") for name in selected for parent in selected if name != parent):
             raise ValueError("Select complete MLP blocks without also targeting their descendants.")
-        if automatic and peft_config.moe_target in ("routed", ["routed"]):
-            selected = self._routed_only_targets(model, selected, peft_config)
-
-        checked_parents = set()
-        if checkpoint_targets is not None:
-            target_roles = self._checkpoint_target_roles(
-                peft_config, model, selected, auxiliary_roots, checked_parents
-            )
-        elif peft_config.target_roles:
-            if set(selected) != set(peft_config.target_roles):
-                raise ValueError("Resolved adapter targets do not match the current model.")
-            target_roles = peft_config.target_roles
-        else:
-            target_roles = self._expand_target_roles(peft_config, model, selected, auxiliary_roots, checked_parents)
-
-        # Parent selections may expand to excluded or separately owned FFNs.
-        target_roles = {path: role for path, role in target_roles.items() if available(path)}
-        resolved = self._validate_target_roles(model, target_roles, checked_parents, peft_config)
-        if automatic and auxiliary_roots and not resolved:
-            raise ValueError("No eligible native FFNs remain outside auxiliary training wrappers and exclusions.")
-        return resolved
+        return selected
 
     @staticmethod
     def _routed_only_targets(model: nn.Module, selected: list[str], config: CortexConfig) -> list[str]:
