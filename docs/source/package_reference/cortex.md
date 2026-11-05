@@ -82,8 +82,6 @@ For MoE, select the parent block, such as `model.layers.0.mlp`, to control branc
 
 Use `modules_to_save` to train and save a full module, such as a classification head. Cortex adapts the FFNs outside those modules and existing auxiliary wrappers. Choose saved modules that do not contain Cortex layers.
 
-Avoid parent-child `modules_to_save` targets across adapters, such as `model.layers.1` and `model.layers.1.mlp`. Nested wrappers can remain after export and prevent native reload.
-
 For a custom FFN using the conventional names below, set `target_modules` explicitly:
 
 - **Computation:** **`down(act(gate(x)) * up(x))`**, or `down(act(up(x)))` without a gate. Use ordinary `nn.Linear` projections named `up_proj`, `down_proj`, and optionally `gate_proj`, with a supported deterministic elementwise activation exposed as `act_fn`, such as SiLU or GELU.
