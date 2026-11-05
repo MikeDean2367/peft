@@ -281,9 +281,10 @@ def export_plan(
 
     def walk(module, path, owner, shared=False):
         if isinstance(module, ModulesToSaveWrapper):
-            module = (
-                module.modules_to_save[module.active_adapter] if module.active_adapters else module.original_module
-            )
+            # Plan padding for the same copy that unloading will retain.
+            selected = module.active_adapters if adapter_names is None else adapter_names
+            adapter = module.check_set_adapter(selected) if selected else None
+            module = module.modules_to_save[adapter] if adapter is not None else module.original_module
         local = getattr(unwrap(module), "config", None)
         if isinstance(local, PretrainedConfig):
             if id(local) in serialized:

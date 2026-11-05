@@ -2369,29 +2369,56 @@ def _reject_parameter_assignment(projection, failure, monkeypatch):
 @pytest.mark.usefixtures("deterministic_cortex_cpu")
 class TestCortexStructuralMerge:
     @pytest.mark.parametrize("saved_target", ["model.layers.1.mlp", "model.layers.1"])
-    def test_export_pads_retained_modules_to_save_copy_and_reloads(self, saved_target, tmp_path):
+    @pytest.mark.parametrize("selection", ["active", "inactive", "original"])
+    def test_export_pads_retained_modules_to_save_copy_and_reloads(self, saved_target, selection, tmp_path):
         base = tiny_model("llama").eval()
         model = get_peft_model(
             base, CortexConfig(k=3, target_modules=["model.layers.0.mlp"], modules_to_save=[saved_target])
         ).eval()
+        if selection != "active":
+            model.add_adapter(
+                "other",
+                CortexConfig(
+                    k=5,
+                    target_modules=["model.layers.0.mlp"],
+                    modules_to_save=[saved_target] if selection == "inactive" else None,
+                ),
+            )
         activate_branches(model)
         wrapper = base.get_submodule(saved_target)
-        retained = wrapper.modules_to_save["default"]
+        selected_adapter = "default" if selection == "active" else "other"
+        retained = wrapper.original_module if selection == "original" else wrapper.modules_to_save[selected_adapter]
         retained_ffn = retained if saved_target.endswith(".mlp") else retained.mlp
-        original_ffn = wrapper.original_module if saved_target.endswith(".mlp") else wrapper.original_module.mlp
-        assert retained_ffn.config is not base.config
+        discarded = wrapper.original_module if selection == "active" else wrapper.modules_to_save["default"]
+        discarded_ffn = discarded if saved_target.endswith(".mlp") else discarded.mlp
+        if selection != "original":
+            assert retained_ffn.config is not base.config
         with torch.no_grad():
             retained_ffn.down_proj.weight.add_(0.1)
         tokens = torch.randint(3, 32, (2, 5))
+        model.set_adapter(selected_adapter)
         expected = model(tokens).logits
-        native = model.merge_and_unload(safe_merge=True)
+        # Explicit export must select and pad the requested copy even when another adapter is active.
+        model.set_adapter("default")
+        adapter_names = None if selection == "active" else [selected_adapter]
+        native = model.merge_and_unload(safe_merge=True, adapter_names=adapter_names)
+        width = 27 if selection == "active" else 29
         assert native.model.layers[1].mlp is retained_ffn
-        assert native.config.intermediate_size == 27
-        assert retained_ffn.config.intermediate_size == 27
-        assert [layer.mlp.down_proj.in_features for layer in native.model.layers] == [27, 27]
-        assert original_ffn.down_proj.in_features == 24
+        assert native.config.intermediate_size == width
+        assert retained_ffn.config.intermediate_size == width
+        assert [layer.mlp.down_proj.in_features for layer in native.model.layers] == [width, width]
+        assert discarded_ffn.down_proj.in_features == 24
         torch.testing.assert_close(native(tokens).logits, expected)
         assert_native_reload(native, tokens, expected, tmp_path)
+
+    def test_export_rejects_ambiguous_saved_module_selection_before_mutation(self):
+        config = CortexConfig(k=3, target_modules=["model.layers.0.mlp"], modules_to_save=["model.layers.1.mlp"])
+        model = get_peft_model(tiny_model("llama"), deepcopy(config)).eval()
+        model.add_adapter("other", deepcopy(config))
+        activate_branches(model)
+        with _unchanged_adapter_model(model, config):
+            with pytest.raises(ValueError, match="Only one adapter"):
+                model.merge_and_unload(adapter_names=["default", "other"])
 
     def test_export_keeps_distinct_serialized_subconfigs(self):
         class Composite(nn.Module):
